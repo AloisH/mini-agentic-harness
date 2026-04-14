@@ -148,22 +148,26 @@ enum ToolCall {
 }
 
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
-    let re = Regex::new(r"(?s)<(bash|search|fetch)>\s*(.*?)\s*</\1>").unwrap();
+    // No backreferences in the regex crate — use alternation with per-tag capture groups.
+    // Group 1 = bash, group 2 = search, group 3 = fetch
+    let re = Regex::new(
+        r"(?s)<bash>\s*(.*?)\s*</bash>|<search>\s*(.*?)\s*</search>|<fetch>\s*(.*?)\s*</fetch>",
+    )
+    .unwrap();
     re.captures_iter(text)
         .map(|cap| {
-            let content = cap[2].to_string();
-            match &cap[1] {
-                "bash"   => ToolCall::Bash(content),
-                "search" => ToolCall::Search(content),
-                "fetch"  => ToolCall::Fetch(content),
-                _        => unreachable!(),
-            }
+            if let Some(m) = cap.get(1) { ToolCall::Bash(m.as_str().to_string()) }
+            else if let Some(m) = cap.get(2) { ToolCall::Search(m.as_str().to_string()) }
+            else { ToolCall::Fetch(cap.get(3).unwrap().as_str().to_string()) }
         })
         .collect()
 }
 
 fn strip_tool_calls(text: &str) -> String {
-    let re = Regex::new(r"(?s)<(bash|search|fetch)>\s*.*?\s*</\1>").unwrap();
+    let re = Regex::new(
+        r"(?s)<bash>\s*.*?\s*</bash>|<search>\s*.*?\s*</search>|<fetch>\s*.*?\s*</fetch>",
+    )
+    .unwrap();
     re.replace_all(text, "").trim().to_string()
 }
 
