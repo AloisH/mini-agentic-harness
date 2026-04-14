@@ -332,7 +332,7 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
         let thought    = strip_tool_calls(&assistant_text);
 
         if !thought.is_empty() {
-            println!("{}", dim(&thought));
+            println!("{}", thought);
         }
 
         if tool_calls.is_empty() {
