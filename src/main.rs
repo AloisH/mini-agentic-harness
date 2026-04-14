@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::Command;
 use std::time::Duration;
 
@@ -72,11 +72,7 @@ fn run_bash(command: &str) -> String {
                 result.push_str("[stderr]\n");
                 result.push_str(stderr.trim_end());
             }
-            if result.is_empty() {
-                "(no output)".into()
-            } else {
-                result
-            }
+            if result.is_empty() { "(no output)".into() } else { result }
         }
         Err(e) => format!("[error] {e}"),
     }
@@ -88,9 +84,7 @@ fn run_bash(command: &str) -> String {
 
 fn extract_bash_blocks(text: &str) -> Vec<String> {
     let re = Regex::new(r"(?s)<bash>\s*(.*?)\s*</bash>").unwrap();
-    re.captures_iter(text)
-        .map(|cap| cap[1].to_string())
-        .collect()
+    re.captures_iter(text).map(|cap| cap[1].to_string()).collect()
 }
 
 fn strip_bash_blocks(text: &str) -> String {
@@ -106,43 +100,21 @@ fn is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
-fn cyan(s: &str) -> String {
-    if is_tty() { format!("\x1b[36m{s}\x1b[0m") } else { s.into() }
-}
-fn green(s: &str) -> String {
-    if is_tty() { format!("\x1b[32m{s}\x1b[0m") } else { s.into() }
-}
-fn yellow(s: &str) -> String {
-    if is_tty() { format!("\x1b[33m{s}\x1b[0m") } else { s.into() }
-}
-fn red(s: &str) -> String {
-    if is_tty() { format!("\x1b[31m{s}\x1b[0m") } else { s.into() }
-}
-fn dim(s: &str) -> String {
-    if is_tty() { format!("\x1b[2m{s}\x1b[0m") } else { s.into() }
-}
+fn cyan(s: &str)   -> String { if is_tty() { format!("\x1b[36m{s}\x1b[0m") } else { s.into() } }
+fn green(s: &str)  -> String { if is_tty() { format!("\x1b[32m{s}\x1b[0m") } else { s.into() } }
+fn yellow(s: &str) -> String { if is_tty() { format!("\x1b[33m{s}\x1b[0m") } else { s.into() } }
+fn red(s: &str)    -> String { if is_tty() { format!("\x1b[31m{s}\x1b[0m") } else { s.into() } }
+fn dim(s: &str)    -> String { if is_tty() { format!("\x1b[2m{s}\x1b[0m")  } else { s.into() } }
+fn bold(s: &str)   -> String { if is_tty() { format!("\x1b[1m{s}\x1b[0m")  } else { s.into() } }
 
 // ---------------------------------------------------------------------------
-// Agentic loop
+// Single agent turn — runs the LLM+bash loop for one user message.
+// Appends everything (assistant replies + tool results) to `messages`.
 // ---------------------------------------------------------------------------
 
-async fn run(prompt: String) -> Result<()> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
-
-    let mut messages = vec![
-        Message { role: "system".into(), content: SYSTEM_PROMPT.into() },
-        Message { role: "user".into(),   content: prompt.clone() },
-    ];
-
-    println!("{}\n", cyan(&format!("[harness] {prompt}")));
-
+async fn agent_turn(client: &Client, messages: &mut Vec<Message>) -> Result<()> {
     for iteration in 1..=MAX_ITERATIONS {
-        let body = json!({
-            "model": MODEL,
-            "messages": messages,
-        });
+        let body = json!({ "model": MODEL, "messages": messages });
 
         let resp = client
             .post(BASE_URL)
@@ -170,12 +142,11 @@ async fn run(prompt: String) -> Result<()> {
         }
 
         if blocks.is_empty() {
-            println!("{}", green("\n[harness] done."));
+            // No bash blocks → the model is done for this turn.
             break;
         }
 
         let mut result_parts: Vec<String> = Vec::new();
-
         for cmd in &blocks {
             println!("{}", yellow(&format!("\n$ {cmd}")));
             let output = run_bash(cmd);
@@ -197,30 +168,102 @@ async fn run(prompt: String) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive REPL — keeps history across turns, type 'exit' or Ctrl-D to quit.
+// ---------------------------------------------------------------------------
+
+async fn interactive(client: &Client) -> Result<()> {
+    println!("{}", bold("Mini Agentic Harness — interactive mode"));
+    println!("{}", dim("Type your message and press Enter. Type 'exit' or Ctrl-D to quit.\n"));
+
+    let mut messages = vec![
+        Message { role: "system".into(), content: SYSTEM_PROMPT.into() },
+    ];
+
+    let stdin = io::stdin();
+    loop {
+        // Print the prompt
+        print!("{} ", cyan("you>"));
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                // Ctrl-D / EOF
+                println!("\n{}", dim("[bye]"));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "exit" || input == "quit" {
+            println!("{}", dim("[bye]"));
+            break;
+        }
+
+        messages.push(Message { role: "user".into(), content: input });
+        println!();
+
+        agent_turn(client, &mut messages).await?;
+        println!();
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Single-shot mode — one prompt, one agentic turn, then exit.
+// ---------------------------------------------------------------------------
+
+async fn single_shot(client: &Client, prompt: String) -> Result<()> {
+    println!("{}\n", cyan(&format!("[harness] {prompt}")));
+
+    let mut messages = vec![
+        Message { role: "system".into(), content: SYSTEM_PROMPT.into() },
+        Message { role: "user".into(),   content: prompt },
+    ];
+
+    agent_turn(client, &mut messages).await?;
+    println!("{}", green("[harness] done."));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let prompt = if !io::stdin().is_terminal() {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    // Piped input → single shot
+    if !io::stdin().is_terminal() {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.is_empty() {
-            eprintln!("Usage:");
-            eprintln!("  mah 'your prompt here'");
-            eprintln!("  echo 'your prompt' | mah");
+        let prompt = buf.trim().to_string();
+        if prompt.is_empty() {
+            eprintln!("Error: empty prompt.");
             std::process::exit(1);
         }
-        args.join(" ")
-    };
-
-    if prompt.is_empty() {
-        eprintln!("Error: empty prompt.");
-        std::process::exit(1);
+        return single_shot(&client, prompt).await;
     }
 
-    run(prompt).await
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    match args.as_slice() {
+        [] => {
+            // No args + tty → interactive mode
+            interactive(&client).await
+        }
+        _ => {
+            // Args provided → single shot
+            single_shot(&client, args.join(" ")).await
+        }
+    }
 }
