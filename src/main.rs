@@ -399,7 +399,7 @@ async fn interactive(client: &Client, url: &str) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
 
     loop {
-        match rl.readline("you> ") {
+        match rl.readline("\x01\x1b[34m\x02you> \x01\x1b[0m\x02") {
             Ok(line) => {
                 let input = line.trim().to_string();
                 if input.is_empty() { continue; }
