@@ -185,14 +185,18 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
     for iteration in 1..=MAX_ITERATIONS {
         let body = json!({ "model": MODEL, "messages": messages });
 
-        let resp = client
+        let raw = client
             .post(url)
             .header("Authorization", "Bearer lm-studio")
             .json(&body)
             .send()
             .await?
-            .json::<ChatResponse>()
+            .text()
             .await?;
+
+        let resp: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!("LM Studio returned an unexpected response ({e}):\n{raw}")
+        })?;
 
         let assistant_text = resp
             .choices
