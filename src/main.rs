@@ -201,22 +201,25 @@ fn run_bash(command: &str) -> String {
 // Web search (DuckDuckGo, no API key)
 // ---------------------------------------------------------------------------
 
-async fn run_search(client: &Client, query: &str) -> String {
-    let resp = client
+async fn run_search(client: &Client, query: &str) -> Result<String, String> {
+    let response = client
         .get("https://html.duckduckgo.com/html/")
         .query(&[("q", query)])
         .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         .timeout(Duration::from_secs(10))
         .send()
-        .await;
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
 
-    let html = match resp {
-        Ok(r) => match r.text().await {
-            Ok(t) => t,
-            Err(e) => return format!("[search error] {e}"),
-        },
-        Err(e) => return format!("[search error] {e}"),
-    };
+    let status = response.status();
+    if status == 429 {
+        return Err("DuckDuckGo rate limit hit — wait a few seconds before searching again.".into());
+    }
+    if !status.is_success() {
+        return Err(format!("DuckDuckGo returned HTTP {status}"));
+    }
+
+    let html = response.text().await.map_err(|e| format!("failed to read response: {e}"))?;
 
     let document = Html::parse_document(&html);
     let title_sel   = Selector::parse("a.result__a").unwrap();
@@ -236,9 +239,9 @@ async fn run_search(client: &Client, query: &str) -> String {
         .collect();
 
     if results.is_empty() {
-        "(no results)".to_string()
+        Ok("(no results)".to_string())
     } else {
-        results.join("\n\n")
+        Ok(results.join("\n\n"))
     }
 }
 
@@ -358,9 +361,16 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
                 }
                 ToolCall::Search(query) => {
                     println!("{}", magenta(&format!("\n[search] {query}")));
-                    let output = run_search(client, query).await;
-                    println!("{}", dim(&output));
-                    result_parts.push(format!("<search_result>\n{output}\n</search_result>"));
+                    match run_search(client, query).await {
+                        Ok(output) => {
+                            println!("{}", dim(&output));
+                            result_parts.push(format!("<search_result>\n{output}\n</search_result>"));
+                        }
+                        Err(e) => {
+                            eprintln!("{}", red(&format!("[search failed] {e}")));
+                            result_parts.push(format!("<search_result>\n[error] {e}\n</search_result>"));
+                        }
+                    }
                 }
                 ToolCall::Fetch(url) => {
                     println!("{}", cyan(&format!("\n[fetch] {url}")));
