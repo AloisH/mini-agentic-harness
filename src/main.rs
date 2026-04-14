@@ -17,34 +17,72 @@ const MODEL: &str = "local-model"; // LM Studio ignores this
 const MAX_ITERATIONS: usize = 20;
 
 // ---------------------------------------------------------------------------
-// WSL2 host detection
+// Host detection — probe multiple candidates
 // ---------------------------------------------------------------------------
+
+/// Collect every plausible host IP for the Windows side of WSL2.
+fn candidate_hosts() -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+
+    // 1. /etc/resolv.conf nameserver
+    if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in contents.lines() {
+            if let Some(ip) = line.strip_prefix("nameserver ") {
+                hosts.push(ip.trim().to_string());
+            }
+        }
+    }
+
+    // 2. Default gateway from /proc/net/route (little-endian hex)
+    if let Ok(contents) = std::fs::read_to_string("/proc/net/route") {
+        for line in contents.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 3 { continue; }
+            let dest = u32::from_str_radix(cols[1], 16).unwrap_or(1);
+            let gw   = u32::from_str_radix(cols[2], 16).unwrap_or(0);
+            if dest == 0 && gw != 0 {
+                let b = gw.to_le_bytes();
+                hosts.push(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]));
+            }
+        }
+    }
+
+    // 3. localhost always last
+    hosts.push("localhost".to_string());
+    hosts
+}
 
 /// Returns the base URL for the LM Studio API.
 ///
 /// Resolution order:
-///   1. `LM_STUDIO_URL` env var  (full override, e.g. "http://192.168.1.5:1234")
-///   2. Windows host IP from /etc/resolv.conf  (WSL2 auto-detect)
-///   3. localhost fallback
-fn lm_studio_url() -> String {
-    // 1. Explicit env override
+///   1. `LM_STUDIO_URL` env var  — full override, e.g. "http://192.168.1.5:1234"
+///   2. Probe: nameserver, default gateway, localhost — first one that responds wins
+async fn lm_studio_url(client: &Client) -> String {
+    // 1. Explicit env override — skip probing entirely
     if let Ok(url) = std::env::var("LM_STUDIO_URL") {
-        return format!("{}/v1/chat/completions", url.trim_end_matches('/'));
+        let base = url.trim_end_matches('/').to_string();
+        return format!("{base}/v1/chat/completions");
     }
 
-    // 2. WSL2: parse nameserver from /etc/resolv.conf
-    let host = std::fs::read_to_string("/etc/resolv.conf")
-        .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .find(|l| l.starts_with("nameserver "))
-                .and_then(|l| l.strip_prefix("nameserver "))
-                .map(|ip| ip.trim().to_string())
-        })
-        .unwrap_or_else(|| "localhost".to_string());
+    // 2. Probe each candidate
+    for host in candidate_hosts() {
+        let probe = format!("http://{}:{}/v1/models", host, DEFAULT_PORT);
+        let ok = client
+            .get(&probe)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok {
+            return format!("http://{}:{}/v1/chat/completions", host, DEFAULT_PORT);
+        }
+    }
 
-    format!("http://{}:{}/v1/chat/completions", host, DEFAULT_PORT)
+    // 3. Nothing responded — fall back to localhost and let the user see the error
+    eprintln!("{}", "\x1b[33m[harness] warning: could not reach LM Studio on any candidate host.\x1b[0m");
+    eprintln!("{}", "\x1b[33m          Set LM_STUDIO_URL=http://<host>:1234 to override.\x1b[0m");
+    format!("http://localhost:{}/v1/chat/completions", DEFAULT_PORT)
 }
 
 const SYSTEM_PROMPT: &str = "\
@@ -273,7 +311,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()?;
 
-    let url = lm_studio_url();
+    let url = lm_studio_url(&client).await;
     println!("{}", dim(&format!("[harness] LM Studio → {url}")));
 
     // Piped input → single shot
