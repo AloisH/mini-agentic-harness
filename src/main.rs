@@ -1,10 +1,11 @@
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
 use regex::Regex;
 use reqwest::Client;
+use rustyline::{error::ReadlineError, DefaultEditor};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -389,36 +390,37 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
 
 async fn interactive(client: &Client, url: &str) -> Result<()> {
     println!("{}", bold("Mini Agentic Harness — interactive mode"));
-    println!("{}", dim("Tools: <bash>, <search>, <fetch>  |  Type 'exit' or Ctrl-D to quit.\n"));
+    println!("{}", dim("Tools: <bash>, <search>, <fetch>  |  Ctrl-D or 'exit' to quit.\n"));
 
     let mut messages = vec![
         Message { role: "system".into(), content: SYSTEM_PROMPT.into() },
     ];
 
-    let stdin = io::stdin();
+    let mut rl = DefaultEditor::new()?;
+
     loop {
-        print!("{} ", cyan("you>"));
-        io::stdout().flush()?;
+        match rl.readline("") {
+            Ok(line) => {
+                let input = line.trim().to_string();
+                if input.is_empty() { continue; }
+                if input == "exit" || input == "quit" {
+                    println!("{}", dim("[bye]"));
+                    break;
+                }
 
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => { println!("\n{}", dim("[bye]")); break; }
-            Ok(_) => {}
-            Err(e) => return Err(e.into()),
+                let _ = rl.add_history_entry(&input);
+                messages.push(Message { role: "user".into(), content: input });
+                println!();
+
+                agent_turn(client, &mut messages, url).await?;
+                println!("{}", dim(&"─".repeat(50)));
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                println!("{}", dim("\n[bye]"));
+                break;
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
         }
-
-        let input = line.trim().to_string();
-        if input.is_empty() { continue; }
-        if input == "exit" || input == "quit" {
-            println!("{}", dim("[bye]"));
-            break;
-        }
-
-        messages.push(Message { role: "user".into(), content: input });
-        println!();
-
-        agent_turn(client, &mut messages, url).await?;
-        println!();
     }
 
     Ok(())
