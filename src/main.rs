@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use regex::Regex;
 use reqwest::Client;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -20,11 +21,9 @@ const MAX_ITERATIONS: usize = 20;
 // Host detection — probe multiple candidates
 // ---------------------------------------------------------------------------
 
-/// Collect every plausible host IP for the Windows side of WSL2.
 fn candidate_hosts() -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
 
-    // 1. /etc/resolv.conf nameserver
     if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
         for line in contents.lines() {
             if let Some(ip) = line.strip_prefix("nameserver ") {
@@ -33,7 +32,6 @@ fn candidate_hosts() -> Vec<String> {
         }
     }
 
-    // 2. Default gateway from /proc/net/route (little-endian hex)
     if let Ok(contents) = std::fs::read_to_string("/proc/net/route") {
         for line in contents.lines().skip(1) {
             let cols: Vec<&str> = line.split_whitespace().collect();
@@ -47,24 +45,16 @@ fn candidate_hosts() -> Vec<String> {
         }
     }
 
-    // 3. localhost always last
     hosts.push("localhost".to_string());
     hosts
 }
 
-/// Returns the base URL for the LM Studio API.
-///
-/// Resolution order:
-///   1. `LM_STUDIO_URL` env var  — full override, e.g. "http://192.168.1.5:1234"
-///   2. Probe: nameserver, default gateway, localhost — first one that responds wins
 async fn lm_studio_url(client: &Client) -> String {
-    // 1. Explicit env override — skip probing entirely
     if let Ok(url) = std::env::var("LM_STUDIO_URL") {
         let base = url.trim_end_matches('/').to_string();
         return format!("{base}/v1/chat/completions");
     }
 
-    // 2. Probe each candidate
     for host in candidate_hosts() {
         let probe = format!("http://{}:{}/v1/models", host, DEFAULT_PORT);
         let ok = client
@@ -79,26 +69,51 @@ async fn lm_studio_url(client: &Client) -> String {
         }
     }
 
-    // 3. Nothing responded — fall back to localhost and let the user see the error
     eprintln!("{}", "\x1b[33m[harness] warning: could not reach LM Studio on any candidate host.\x1b[0m");
     eprintln!("{}", "\x1b[33m          Set LM_STUDIO_URL=http://<host>:1234 to override.\x1b[0m");
     format!("http://localhost:{}/v1/chat/completions", DEFAULT_PORT)
 }
 
+// ---------------------------------------------------------------------------
+// System prompt
+// ---------------------------------------------------------------------------
+
 const SYSTEM_PROMPT: &str = "\
-You are a helpful AI assistant that can run bash commands on the user's machine.
+You are a helpful AI assistant with access to three tools: bash, search, and fetch.
 
-When you need to execute a shell command, wrap it like this:
+To use a tool, output EXACTLY one of these XML tags — nothing else on those lines:
 
+Run a shell command:
 <bash>
-your command here
+command here
 </bash>
 
-Rules:
-- You can use multiple <bash> blocks in one reply.
-- After each block is executed you will receive the output inside <bash_result> tags.
-- Keep reasoning and issuing bash blocks until the task is fully done.
-- When you have a final answer, reply normally with NO <bash> blocks.
+Search the web:
+<search>
+search query here
+</search>
+
+Fetch a web page:
+<fetch>
+https://example.com
+</fetch>
+
+CRITICAL RULES — you MUST follow these exactly:
+- Use ONLY the XML tag format shown above. No other format is allowed.
+- Do NOT write <|tool_call>, ```bash, or any other syntax. Only <bash>, <search>, <fetch>.
+- After a tool block, wait for the result — do not continue the response.
+- Results come back inside <bash_result>, <search_result>, or <fetch_result> tags.
+- When your task is fully done, reply with plain text and NO tool tags.
+
+Example of correct usage:
+User: what is the weather in Paris?
+Assistant: <search>
+weather in Paris today
+</search>
+<search_result>
+...results...
+</search_result>
+The weather in Paris is currently 18°C and cloudy.
 ";
 
 // ---------------------------------------------------------------------------
@@ -122,7 +137,38 @@ struct ChatResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Bash execution
+// Tool call extraction
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum ToolCall {
+    Bash(String),
+    Search(String),
+    Fetch(String),
+}
+
+fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
+    let re = Regex::new(r"(?s)<(bash|search|fetch)>\s*(.*?)\s*</\1>").unwrap();
+    re.captures_iter(text)
+        .map(|cap| {
+            let content = cap[2].to_string();
+            match &cap[1] {
+                "bash"   => ToolCall::Bash(content),
+                "search" => ToolCall::Search(content),
+                "fetch"  => ToolCall::Fetch(content),
+                _        => unreachable!(),
+            }
+        })
+        .collect()
+}
+
+fn strip_tool_calls(text: &str) -> String {
+    let re = Regex::new(r"(?s)<(bash|search|fetch)>\s*.*?\s*</\1>").unwrap();
+    re.replace_all(text, "").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Bash
 // ---------------------------------------------------------------------------
 
 fn run_bash(command: &str) -> String {
@@ -135,9 +181,7 @@ fn run_bash(command: &str) -> String {
                 result.push_str(stdout.trim_end());
             }
             if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
+                if !result.is_empty() { result.push('\n'); }
                 result.push_str("[stderr]\n");
                 result.push_str(stderr.trim_end());
             }
@@ -148,26 +192,99 @@ fn run_bash(command: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Web search (DuckDuckGo, no API key)
 // ---------------------------------------------------------------------------
 
-fn extract_bash_blocks(text: &str) -> Vec<String> {
-    let re = Regex::new(r"(?s)<bash>\s*(.*?)\s*</bash>").unwrap();
-    re.captures_iter(text).map(|cap| cap[1].to_string()).collect()
-}
+async fn run_search(client: &Client, query: &str) -> String {
+    let resp = client
+        .get("https://html.duckduckgo.com/html/")
+        .query(&[("q", query)])
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
 
-fn strip_bash_blocks(text: &str) -> String {
-    let re = Regex::new(r"(?s)<bash>\s*.*?\s*</bash>").unwrap();
-    re.replace_all(text, "").trim().to_string()
+    let html = match resp {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(e) => return format!("[search error] {e}"),
+        },
+        Err(e) => return format!("[search error] {e}"),
+    };
+
+    let document = Html::parse_document(&html);
+    let title_sel   = Selector::parse("a.result__a").unwrap();
+    let snippet_sel = Selector::parse(".result__snippet").unwrap();
+
+    let titles:   Vec<String> = document.select(&title_sel)
+        .map(|e| e.text().collect::<String>().trim().to_string())
+        .collect();
+    let snippets: Vec<String> = document.select(&snippet_sel)
+        .map(|e| e.text().collect::<String>().trim().to_string())
+        .collect();
+
+    let results: Vec<String> = titles.iter().zip(snippets.iter())
+        .take(5)
+        .enumerate()
+        .map(|(i, (title, snippet))| format!("{}. {}\n   {}", i + 1, title, snippet))
+        .collect();
+
+    if results.is_empty() {
+        "(no results)".to_string()
+    } else {
+        results.join("\n\n")
+    }
 }
 
 // ---------------------------------------------------------------------------
-// ANSI helpers (only when stdout is a tty)
+// Web fetch (returns readable page text)
 // ---------------------------------------------------------------------------
 
-fn is_tty() -> bool {
-    io::stdout().is_terminal()
+async fn run_fetch(client: &Client, url: &str) -> String {
+    let url = url.trim();
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+
+    let html = match resp {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(e) => return format!("[fetch error] {e}"),
+        },
+        Err(e) => return format!("[fetch error] {e}"),
+    };
+
+    // Strip tags, collapse whitespace, truncate to keep context reasonable
+    let document = Html::parse_document(&html);
+    let body_sel = Selector::parse("body").unwrap();
+    let text: String = document
+        .select(&body_sel)
+        .next()
+        .map(|b| b.text().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+
+    // Collapse runs of whitespace
+    let re = Regex::new(r"\s{2,}").unwrap();
+    let clean = re.replace_all(text.trim(), " ").to_string();
+
+    // Cap at ~4000 chars so it fits in context
+    if clean.len() > 4000 {
+        format!("{}… [truncated]", &clean[..4000])
+    } else if clean.is_empty() {
+        "(empty page)".to_string()
+    } else {
+        clean
+    }
 }
+
+// ---------------------------------------------------------------------------
+// ANSI helpers
+// ---------------------------------------------------------------------------
+
+fn is_tty() -> bool { io::stdout().is_terminal() }
 
 fn cyan(s: &str)   -> String { if is_tty() { format!("\x1b[36m{s}\x1b[0m") } else { s.into() } }
 fn green(s: &str)  -> String { if is_tty() { format!("\x1b[32m{s}\x1b[0m") } else { s.into() } }
@@ -175,10 +292,10 @@ fn yellow(s: &str) -> String { if is_tty() { format!("\x1b[33m{s}\x1b[0m") } els
 fn red(s: &str)    -> String { if is_tty() { format!("\x1b[31m{s}\x1b[0m") } else { s.into() } }
 fn dim(s: &str)    -> String { if is_tty() { format!("\x1b[2m{s}\x1b[0m")  } else { s.into() } }
 fn bold(s: &str)   -> String { if is_tty() { format!("\x1b[1m{s}\x1b[0m")  } else { s.into() } }
+fn magenta(s: &str)-> String { if is_tty() { format!("\x1b[35m{s}\x1b[0m") } else { s.into() } }
 
 // ---------------------------------------------------------------------------
-// Single agent turn — runs the LLM+bash loop for one user message.
-// Appends everything (assistant replies + tool results) to `messages`.
+// Agent turn
 // ---------------------------------------------------------------------------
 
 async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> Result<()> {
@@ -207,24 +324,40 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
 
         messages.push(Message { role: "assistant".into(), content: assistant_text.clone() });
 
-        let blocks  = extract_bash_blocks(&assistant_text);
-        let thought = strip_bash_blocks(&assistant_text);
+        let tool_calls = extract_tool_calls(&assistant_text);
+        let thought    = strip_tool_calls(&assistant_text);
 
         if !thought.is_empty() {
             println!("{}", dim(&thought));
         }
 
-        if blocks.is_empty() {
-            // No bash blocks → the model is done for this turn.
+        if tool_calls.is_empty() {
             break;
         }
 
         let mut result_parts: Vec<String> = Vec::new();
-        for cmd in &blocks {
-            println!("{}", yellow(&format!("\n$ {cmd}")));
-            let output = run_bash(cmd);
-            println!("{}", dim(&output));
-            result_parts.push(format!("<bash_result>\n$ {cmd}\n{output}\n</bash_result>"));
+
+        for call in &tool_calls {
+            match call {
+                ToolCall::Bash(cmd) => {
+                    println!("{}", yellow(&format!("\n$ {cmd}")));
+                    let output = run_bash(cmd);
+                    println!("{}", dim(&output));
+                    result_parts.push(format!("<bash_result>\n$ {cmd}\n{output}\n</bash_result>"));
+                }
+                ToolCall::Search(query) => {
+                    println!("{}", magenta(&format!("\n[search] {query}")));
+                    let output = run_search(client, query).await;
+                    println!("{}", dim(&output));
+                    result_parts.push(format!("<search_result>\n{output}\n</search_result>"));
+                }
+                ToolCall::Fetch(url) => {
+                    println!("{}", cyan(&format!("\n[fetch] {url}")));
+                    let output = run_fetch(client, url).await;
+                    println!("{}", dim(&output));
+                    result_parts.push(format!("<fetch_result>\n{output}\n</fetch_result>"));
+                }
+            }
         }
 
         messages.push(Message {
@@ -241,12 +374,12 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Interactive REPL — keeps history across turns, type 'exit' or Ctrl-D to quit.
+// Interactive REPL
 // ---------------------------------------------------------------------------
 
 async fn interactive(client: &Client, url: &str) -> Result<()> {
     println!("{}", bold("Mini Agentic Harness — interactive mode"));
-    println!("{}", dim("Type your message and press Enter. Type 'exit' or Ctrl-D to quit.\n"));
+    println!("{}", dim("Tools: <bash>, <search>, <fetch>  |  Type 'exit' or Ctrl-D to quit.\n"));
 
     let mut messages = vec![
         Message { role: "system".into(), content: SYSTEM_PROMPT.into() },
@@ -254,25 +387,18 @@ async fn interactive(client: &Client, url: &str) -> Result<()> {
 
     let stdin = io::stdin();
     loop {
-        // Print the prompt
         print!("{} ", cyan("you>"));
         io::stdout().flush()?;
 
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                // Ctrl-D / EOF
-                println!("\n{}", dim("[bye]"));
-                break;
-            }
+            Ok(0) => { println!("\n{}", dim("[bye]")); break; }
             Ok(_) => {}
             Err(e) => return Err(e.into()),
         }
 
         let input = line.trim().to_string();
-        if input.is_empty() {
-            continue;
-        }
+        if input.is_empty() { continue; }
         if input == "exit" || input == "quit" {
             println!("{}", dim("[bye]"));
             break;
@@ -289,7 +415,7 @@ async fn interactive(client: &Client, url: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Single-shot mode — one prompt, one agentic turn, then exit.
+// Single-shot
 // ---------------------------------------------------------------------------
 
 async fn single_shot(client: &Client, url: &str, prompt: String) -> Result<()> {
@@ -318,7 +444,6 @@ async fn main() -> Result<()> {
     let url = lm_studio_url(&client).await;
     println!("{}", dim(&format!("[harness] LM Studio → {url}")));
 
-    // Piped input → single shot
     if !io::stdin().is_terminal() {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
@@ -333,13 +458,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.as_slice() {
-        [] => {
-            // No args + tty → interactive mode
-            interactive(&client, &url).await
-        }
-        _ => {
-            // Args provided → single shot
-            single_shot(&client, &url, args.join(" ")).await
-        }
+        [] => interactive(&client, &url).await,
+        _  => single_shot(&client, &url, args.join(" ")).await,
     }
 }

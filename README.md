@@ -105,23 +105,32 @@ All tunables are constants at the top of `src/main.rs`:
 
 `LM_STUDIO_URL` env var skips host probing entirely and uses the given address.
 
-## Bash tool syntax
+## Tools
 
-The system prompt instructs the LLM to wrap shell commands like this:
+The LLM has three tools available, all using XML tag syntax:
 
+### `<bash>` — run a shell command
 ```
 <bash>
-your command here
+ls -lh /tmp
 </bash>
 ```
+Result comes back as `<bash_result>`.
 
-Results are returned as:
+### `<search>` — web search (DuckDuckGo, no API key needed)
+```
+<search>
+latest rust async features
+</search>
+```
+Returns top 5 results (title + snippet). Result comes back as `<search_result>`.
 
+### `<fetch>` — fetch a web page
 ```
-<bash_result>
-$ your command here
-output...
-</bash_result>
+<fetch>
+https://example.com/article
+</fetch>
 ```
+Returns the page's readable text content (capped at ~4000 chars). Result comes back as `<fetch_result>`.
 
 Works with any instruction-following model (Mistral, Llama 3, Qwen, Deepseek, etc.).
