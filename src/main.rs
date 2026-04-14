@@ -129,6 +129,7 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,12 +320,17 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> 
             anyhow::anyhow!("LM Studio returned an unexpected response ({e}):\n{raw}")
         })?;
 
-        let assistant_text = resp
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
+        let choice = resp.choices.into_iter().next().unwrap_or_else(|| Choice {
+            message: Message { role: "assistant".into(), content: String::new() },
+            finish_reason: None,
+        });
+
+        if choice.finish_reason.as_deref() == Some("length") {
+            eprintln!("{}", red("\n[harness] context limit reached — the model was cut off mid-response."));
+            eprintln!("{}", red("          Start a new session or use a model with a larger context window.\n"));
+        }
+
+        let assistant_text = choice.message.content;
 
         messages.push(Message { role: "assistant".into(), content: assistant_text.clone() });
 
