@@ -12,9 +12,40 @@ use serde_json::json;
 // Config
 // ---------------------------------------------------------------------------
 
-const BASE_URL: &str = "http://localhost:1234/v1/chat/completions";
+const DEFAULT_PORT: u16 = 1234;
 const MODEL: &str = "local-model"; // LM Studio ignores this
 const MAX_ITERATIONS: usize = 20;
+
+// ---------------------------------------------------------------------------
+// WSL2 host detection
+// ---------------------------------------------------------------------------
+
+/// Returns the base URL for the LM Studio API.
+///
+/// Resolution order:
+///   1. `LM_STUDIO_URL` env var  (full override, e.g. "http://192.168.1.5:1234")
+///   2. Windows host IP from /etc/resolv.conf  (WSL2 auto-detect)
+///   3. localhost fallback
+fn lm_studio_url() -> String {
+    // 1. Explicit env override
+    if let Ok(url) = std::env::var("LM_STUDIO_URL") {
+        return format!("{}/v1/chat/completions", url.trim_end_matches('/'));
+    }
+
+    // 2. WSL2: parse nameserver from /etc/resolv.conf
+    let host = std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .find(|l| l.starts_with("nameserver "))
+                .and_then(|l| l.strip_prefix("nameserver "))
+                .map(|ip| ip.trim().to_string())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+
+    format!("http://{}:{}/v1/chat/completions", host, DEFAULT_PORT)
+}
 
 const SYSTEM_PROMPT: &str = "\
 You are a helpful AI assistant that can run bash commands on the user's machine.
@@ -112,12 +143,12 @@ fn bold(s: &str)   -> String { if is_tty() { format!("\x1b[1m{s}\x1b[0m")  } els
 // Appends everything (assistant replies + tool results) to `messages`.
 // ---------------------------------------------------------------------------
 
-async fn agent_turn(client: &Client, messages: &mut Vec<Message>) -> Result<()> {
+async fn agent_turn(client: &Client, messages: &mut Vec<Message>, url: &str) -> Result<()> {
     for iteration in 1..=MAX_ITERATIONS {
         let body = json!({ "model": MODEL, "messages": messages });
 
         let resp = client
-            .post(BASE_URL)
+            .post(url)
             .header("Authorization", "Bearer lm-studio")
             .json(&body)
             .send()
@@ -171,7 +202,7 @@ async fn agent_turn(client: &Client, messages: &mut Vec<Message>) -> Result<()> 
 // Interactive REPL — keeps history across turns, type 'exit' or Ctrl-D to quit.
 // ---------------------------------------------------------------------------
 
-async fn interactive(client: &Client) -> Result<()> {
+async fn interactive(client: &Client, url: &str) -> Result<()> {
     println!("{}", bold("Mini Agentic Harness — interactive mode"));
     println!("{}", dim("Type your message and press Enter. Type 'exit' or Ctrl-D to quit.\n"));
 
@@ -208,7 +239,7 @@ async fn interactive(client: &Client) -> Result<()> {
         messages.push(Message { role: "user".into(), content: input });
         println!();
 
-        agent_turn(client, &mut messages).await?;
+        agent_turn(client, &mut messages, url).await?;
         println!();
     }
 
@@ -219,7 +250,7 @@ async fn interactive(client: &Client) -> Result<()> {
 // Single-shot mode — one prompt, one agentic turn, then exit.
 // ---------------------------------------------------------------------------
 
-async fn single_shot(client: &Client, prompt: String) -> Result<()> {
+async fn single_shot(client: &Client, url: &str, prompt: String) -> Result<()> {
     println!("{}\n", cyan(&format!("[harness] {prompt}")));
 
     let mut messages = vec![
@@ -227,7 +258,7 @@ async fn single_shot(client: &Client, prompt: String) -> Result<()> {
         Message { role: "user".into(),   content: prompt },
     ];
 
-    agent_turn(client, &mut messages).await?;
+    agent_turn(client, &mut messages, url).await?;
     println!("{}", green("[harness] done."));
     Ok(())
 }
@@ -242,6 +273,9 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()?;
 
+    let url = lm_studio_url();
+    println!("{}", dim(&format!("[harness] LM Studio → {url}")));
+
     // Piped input → single shot
     if !io::stdin().is_terminal() {
         let mut buf = String::new();
@@ -251,7 +285,7 @@ async fn main() -> Result<()> {
             eprintln!("Error: empty prompt.");
             std::process::exit(1);
         }
-        return single_shot(&client, prompt).await;
+        return single_shot(&client, &url, prompt).await;
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -259,11 +293,11 @@ async fn main() -> Result<()> {
     match args.as_slice() {
         [] => {
             // No args + tty → interactive mode
-            interactive(&client).await
+            interactive(&client, &url).await
         }
         _ => {
             // Args provided → single shot
-            single_shot(&client, args.join(" ")).await
+            single_shot(&client, &url, args.join(" ")).await
         }
     }
 }
