@@ -399,7 +399,7 @@ async fn interactive(client: &Client, url: &str) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
 
     loop {
-        match rl.readline("") {
+        match rl.readline("you> ") {
             Ok(line) => {
                 let input = line.trim().to_string();
                 if input.is_empty() { continue; }
